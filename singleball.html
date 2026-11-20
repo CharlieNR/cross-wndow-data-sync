@@ -37,316 +37,341 @@
 (() => {
   'use strict';
 
-  const WINDOWS_PREFIX = 'singleball_window_';
-  const BALL_KEY = 'singleball_shared_ball_v1';
-  const WINDOW_TTL = 15000;
-  const HEARTBEAT_MS = 1000;
+  // One shared ball in desktop screen coordinates. Each window is only a
+  // viewport onto that shared world; no window owns a private copy of the ball.
+  const WINDOWS_PREFIX = 'singleball_v2_window_';
+  const BALL_KEY = 'singleball_v2_ball';
+  const WINDOW_TTL_MS = 4000;
+  const HEARTBEAT_MS = 350;
+  const REGISTRY_READ_MS = 100;
+  const BALL_WRITE_MS = 25;
   const BALL_SIZE = 34;
-  const SPEED = 2.7;
+  const BALL_RADIUS = BALL_SIZE / 2;
+  const GAP_EDGE_ALLOWANCE = 0.51; // 0.51px per edge bridges a 1px gap.
+  const INITIAL_VX = 162;
+  const INITIAL_VY = 116.64;
+  const MAX_SPEED = 420;
 
   const ballElement = document.getElementById('ball');
   const statusElement = document.getElementById('status');
   const helpElement = document.getElementById('help');
 
-  let id = sessionStorage.getItem('singleball_window_id');
-  if (!id) {
-    id = 'w_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
-    sessionStorage.setItem('singleball_window_id', id);
-  }
+  const id = 'w_' + Date.now().toString(36) + '_' +
+    Math.random().toString(36).slice(2);
 
-  let lastFrame = performance.now();
+  let ownRect = null;
+  let ownRecord = null;
+  let windows = [];
+  let ballState = null;
+  let wasHost = false;
   let lastHeartbeat = 0;
-  let lastPosition = '';
-  let cachedWindows = [];
-  let ball = null;
+  let lastRegistryRead = 0;
+  let lastBallWrite = 0;
+  let lastStatusUpdate = 0;
+  let lastFocusState = null;
 
   function viewportRect() {
-    // screenX/screenY describe the outer browser window. Convert to the page viewport.
-    const left = window.screenX;
-    const top = window.screenY;
+    // Translate the page viewport, rather than the outer window frame, into
+    // global screen coordinates. All same-browser windows share these insets.
+    const horizontalInset = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+    const verticalInset = Math.max(0, window.outerHeight - window.innerHeight);
     return {
-      left, top,
-      right: left + window.outerWidth,
-      bottom: top + window.outerHeight,
-      contentLeft: left + Math.max(0, (window.outerWidth - window.innerWidth) / 2),
-      contentTop: top + Math.max(0, window.outerHeight - window.innerHeight),
-      width: window.innerWidth,
-      height: window.innerHeight
+      x: window.screenX + horizontalInset,
+      y: window.screenY + verticalInset,
+      w: window.innerWidth,
+      h: window.innerHeight
     };
+  }
+
+  function publishSelf(force = false) {
+    const now = Date.now();
+    const rect = viewportRect();
+    const focused = document.hasFocus();
+    const visible = document.visibilityState !== 'hidden';
+    const geometryChanged = !ownRect ||
+      rect.x !== ownRect.x || rect.y !== ownRect.y ||
+      rect.w !== ownRect.w || rect.h !== ownRect.h;
+    const focusChanged = focused !== lastFocusState;
+
+    if (!force && !geometryChanged && !focusChanged &&
+        now - lastHeartbeat < HEARTBEAT_MS) return;
+
+    const focusedAt = focused
+      ? (focusChanged || !ownRecord ? now : ownRecord.focusedAt)
+      : 0;
+
+    ownRect = rect;
+    ownRecord = {
+      id, ...rect, focused, visible, focusedAt,
+      heartbeat: now
+    };
+
+    localStorage.setItem(WINDOWS_PREFIX + id, JSON.stringify(ownRecord));
+    lastHeartbeat = now;
+    lastFocusState = focused;
   }
 
   function readWindows() {
     const now = Date.now();
     const found = [];
+
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
       if (!key || !key.startsWith(WINDOWS_PREFIX)) continue;
+
       try {
         const entry = JSON.parse(localStorage.getItem(key));
-        if (entry && now - entry.heartbeat < WINDOW_TTL) found.push(entry);
-        else localStorage.removeItem(key);
+        const valid = entry && typeof entry.id === 'string' &&
+          Number.isFinite(entry.x) && Number.isFinite(entry.y) &&
+          Number.isFinite(entry.w) && Number.isFinite(entry.h) &&
+          entry.w > 0 && entry.h > 0 &&
+          Number.isFinite(entry.heartbeat);
+
+        if (!valid || now - entry.heartbeat > WINDOW_TTL_MS) {
+          localStorage.removeItem(key);
+          continue;
+        }
+        if (entry.visible !== false) found.push(entry);
       } catch (_) {
         localStorage.removeItem(key);
       }
     }
+
     return found;
   }
 
-  function heartbeat() {
-    const rect = viewportRect();
-    const signature = [rect.left, rect.top, rect.width, rect.height].join(':');
-    // Always refresh the timestamp; geometry is sampled continuously so moving a window
-    // immediately changes which neighbours qualify as connected.
-    localStorage.setItem(WINDOWS_PREFIX + id, JSON.stringify({
-      id, left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom,
-      contentLeft: rect.contentLeft, contentTop: rect.contentTop,
-      width: rect.width, height: rect.height, heartbeat: Date.now()
-    }));
-    if (signature !== lastPosition) {
-      lastPosition = signature;
-      cachedWindows = readWindows();
-    }
-    lastHeartbeat = Date.now();
+  function electHost(availableWindows) {
+    if (!availableWindows.length) return null;
+
+    // The focused page drives physics for responsiveness. If no page currently
+    // has focus (for example, another desktop app is selected), elect a stable
+    // visible page instead. Every page still renders independently.
+    const focused = availableWindows.filter(w => w.focused);
+    const candidates = focused.length ? focused : availableWindows;
+
+    candidates.sort((a, b) =>
+      (Number(b.focusedAt) || 0) - (Number(a.focusedAt) || 0) ||
+      a.id.localeCompare(b.id)
+    );
+    return candidates[0].id;
   }
 
-  function getBall() {
+  function coveredAt(rects, x, y) {
+    const pad = GAP_EDGE_ALLOWANCE;
+    return rects.some(r =>
+      x >= r.x - pad && x <= r.x + r.w + pad &&
+      y >= r.y - pad && y <= r.y + r.h + pad
+    );
+  }
+
+  function nearestCoveredPoint(rects, x, y) {
+    let best = null;
+    let bestDistance = Infinity;
+    const pad = GAP_EDGE_ALLOWANCE;
+
+    for (const r of rects) {
+      const px = Math.max(r.x - pad, Math.min(r.x + r.w + pad, x));
+      const py = Math.max(r.y - pad, Math.min(r.y + r.h + pad, y));
+      const distance = (px - x) ** 2 + (py - y) ** 2;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = { x: px, y: py };
+      }
+    }
+    return best;
+  }
+
+  function createBall(rects, hostId, now) {
+    const start = rects.find(r => r.id === hostId) || rects[0];
+    return {
+      x: start.x + start.w / 2,
+      y: start.y + start.h / 2,
+      vx: INITIAL_VX,
+      vy: INITIAL_VY,
+      updated: now
+    };
+  }
+
+  function readBall() {
     try {
       const value = JSON.parse(localStorage.getItem(BALL_KEY));
-      if (value && value.owner && Number.isFinite(value.x) && Number.isFinite(value.y)) return value;
+      if (value && Number.isFinite(value.x) && Number.isFinite(value.y) &&
+          Number.isFinite(value.vx) && Number.isFinite(value.vy) &&
+          Number.isFinite(value.updated)) return value;
     } catch (_) {}
     return null;
   }
 
-  function saveBall(next) {
-    next.updated = Date.now();
+  function writeBall(next) {
+    ballState = next;
     localStorage.setItem(BALL_KEY, JSON.stringify(next));
-    ball = next;
+    lastBallWrite = Date.now();
   }
 
-  function ensureBall() {
-    ball = getBall();
-    if (!ball) {
-      const x = Math.max(0, (window.innerWidth - BALL_SIZE) / 2);
-      const y = Math.max(0, (window.innerHeight - BALL_SIZE) / 2);
-      saveBall({ owner: id, x, y, vx: SPEED, vy: SPEED * 0.72, updated: Date.now() });
+  function advanceBall(current, rects, now) {
+    if (!rects.length) return current;
+
+    let x = current.x;
+    let y = current.y;
+    let vx = current.vx;
+    let vy = current.vy;
+
+    // If a user moves a window away from underneath the ball, the newly
+    // uncovered area is a wall. Move the ball to the nearest covered point
+    // and reflect it back into the remaining window layout.
+    if (!coveredAt(rects, x, y)) {
+      const nearest = nearestCoveredPoint(rects, x, y);
+      if (!nearest) return current;
+      if (nearest.x > x) vx = Math.abs(vx);
+      else if (nearest.x < x) vx = -Math.abs(vx);
+      if (nearest.y > y) vy = Math.abs(vy);
+      else if (nearest.y < y) vy = -Math.abs(vy);
+      x = nearest.x;
+      y = nearest.y;
     }
-  }
 
-  function nearlyEqual(a, b, tolerance) {
-    return Math.abs(a - b) <= tolerance;
-  }
+    // Time-based physics continues correctly when a background page is
+    // throttled and then becomes the driver. Small spatial steps prevent
+    // tunnelling through narrow connections or one-pixel gaps.
+    const elapsedMs = Math.max(0, Math.min(now - current.updated, 1000));
+    const seconds = elapsedMs / 1000;
+    const distance = Math.max(Math.abs(vx), Math.abs(vy)) * seconds;
+    const steps = Math.max(1, Math.ceil(distance / 0.75));
+    const dt = steps ? seconds / steps : 0;
 
-  function findNeighbour(edge, ballCentre) {
-    const here = viewportRect();
-    const others = readWindows().filter(w => w.id !== id);
-
-    for (const other of others) {
-      let touches = false;
-      let targetX = 0;
-      let targetY = 0;
-      if (edge === 'right') {
-        const overlapStart = Math.max(here.contentTop, other.contentTop);
-        const overlapEnd = Math.min(here.contentTop + here.height, other.contentTop + other.height);
-        touches = nearlyEqual(here.right, other.left, 3) &&
-          overlapEnd > overlapStart && ballCentre >= overlapStart && ballCentre <= overlapEnd;
-        if (touches) {
-          targetX = 1;
-          targetY = ballCentre - other.contentTop - BALL_SIZE / 2;
-        }
-      } else if (edge === 'left') {
-        const overlapStart = Math.max(here.contentTop, other.contentTop);
-        const overlapEnd = Math.min(here.contentTop + here.height, other.contentTop + other.height);
-        touches = nearlyEqual(here.left, other.right, 3) &&
-          overlapEnd > overlapStart && ballCentre >= overlapStart && ballCentre <= overlapEnd;
-        if (touches) {
-          targetX = other.width - BALL_SIZE - 1;
-          targetY = ballCentre - other.contentTop - BALL_SIZE / 2;
-        }
-      } else if (edge === 'bottom') {
-        const overlapStart = Math.max(here.contentLeft, other.contentLeft);
-        const overlapEnd = Math.min(here.contentLeft + here.width, other.contentLeft + other.width);
-        touches = nearlyEqual(here.bottom, other.top, 3) &&
-          overlapEnd > overlapStart && ballCentre >= overlapStart && ballCentre <= overlapEnd;
-        if (touches) {
-          targetX = ballCentre - other.contentLeft - BALL_SIZE / 2;
-          targetY = 1;
-        }
-      } else if (edge === 'top') {
-        const overlapStart = Math.max(here.contentLeft, other.contentLeft);
-        const overlapEnd = Math.min(here.contentLeft + here.width, other.contentLeft + other.width);
-        touches = nearlyEqual(here.top, other.bottom, 3) &&
-          overlapEnd > overlapStart && ballCentre >= overlapStart && ballCentre <= overlapEnd;
-        if (touches) {
-          targetX = ballCentre - other.contentLeft - BALL_SIZE / 2;
-          targetY = other.height - BALL_SIZE - 1;
-        }
-      }
-      if (touches) return { window: other, x: targetX, y: targetY };
-    }
-    return null;
-  }
-
-  function keepInside(value, max) {
-    return Math.max(0, Math.min(Math.max(0, max), value));
-  }
-
-  function step(delta) {
-    // The active browser window is the single simulation driver. Background
-    // pages may be throttled by the browser, so they must not compete to move it.
-    if (document.visibilityState !== 'visible' || !document.hasFocus()) return;
-
-    const shared = getBall();
-    if (!shared) return;
-
-    const windows = readWindows();
-    let ownerWindow = windows.find(w => w.id === shared.owner);
-    if (!ownerWindow) ownerWindow = windows.find(w => w.id === id);
-    if (!ownerWindow) return;
-
-    const dt = Math.min(Math.max(delta, 0), 32) / 16.67;
-    const half = BALL_SIZE / 2;
-    const oldX = ownerWindow.contentLeft + shared.x + half;
-    const oldY = ownerWindow.contentTop + shared.y + half;
-    let nextX = oldX + shared.vx * dt;
-    let nextY = oldY + shared.vy * dt;
-
-    const minX = ownerWindow.contentLeft + half;
-    const maxX = ownerWindow.contentLeft + ownerWindow.width - half;
-    const minY = ownerWindow.contentTop + half;
-    const maxY = ownerWindow.contentTop + ownerWindow.height - half;
-
-    const contains = (w, x, y) =>
-      x >= w.contentLeft + half && x <= w.contentLeft + w.width - half &&
-      y >= w.contentTop + half && y <= w.contentTop + w.height - half;
-
-    // Swept point/rectangle test. A 1.5px expansion makes a one-pixel
-    // physical gap traversable and prevents a frame from skipping the opening.
-    function segmentHitsWindow(w, x0, y0, x1, y1) {
-      const pad = 1.5;
-      const left = w.contentLeft + half - pad;
-      const right = w.contentLeft + w.width - half + pad;
-      const top = w.contentTop + half - pad;
-      const bottom = w.contentTop + w.height - half + pad;
-      const dx = x1 - x0, dy = y1 - y0;
-      let enter = 0, leave = 1;
-
-      if (Math.abs(dx) < 1e-9) {
-        if (x0 < left || x0 > right) return false;
+    for (let i = 0; i < steps; i++) {
+      const nextX = x + vx * dt;
+      if (coveredAt(rects, nextX, y)) {
+        x = nextX;
       } else {
-        const a = (left - x0) / dx, b = (right - x0) / dx;
-        enter = Math.max(enter, Math.min(a, b));
-        leave = Math.min(leave, Math.max(a, b));
+        vx = -vx;
       }
-      if (Math.abs(dy) < 1e-9) {
-        if (y0 < top || y0 > bottom) return false;
+
+      const nextY = y + vy * dt;
+      if (coveredAt(rects, x, nextY)) {
+        y = nextY;
       } else {
-        const a = (top - y0) / dy, b = (bottom - y0) / dy;
-        enter = Math.max(enter, Math.min(a, b));
-        leave = Math.min(leave, Math.max(a, b));
+        vy = -vy;
       }
-      return enter <= leave && leave >= 0 && enter <= 1;
     }
 
-    const focusedWindow = windows.find(w => w.id === id);
-    let destination = null;
-
-    if (contains(ownerWindow, nextX, nextY)) {
-      destination = ownerWindow;
-      if (focusedWindow && focusedWindow.id !== ownerWindow.id &&
-          contains(focusedWindow, nextX, nextY)) destination = focusedWindow;
-    } else {
-      const candidates = windows.filter(w => w.id !== ownerWindow.id &&
-        segmentHitsWindow(w, oldX, oldY, nextX, nextY));
-      // Prefer the focused viewport when it is one of the valid crossings.
-      destination = (focusedWindow && candidates.includes(focusedWindow))
-        ? focusedWindow : (candidates[0] || null);
+    const speed = Math.hypot(vx, vy);
+    if (speed > MAX_SPEED) {
+      vx = vx / speed * MAX_SPEED;
+      vy = vy / speed * MAX_SPEED;
     }
 
-    if (!destination) {
-      // Reflect each axis independently; corner impacts bounce on both axes.
-      if (nextX < minX) {
-        nextX = minX + (minX - nextX);
-        shared.vx = Math.abs(shared.vx);
-      } else if (nextX > maxX) {
-        nextX = maxX - (nextX - maxX);
-        shared.vx = -Math.abs(shared.vx);
-      }
-      if (nextY < minY) {
-        nextY = minY + (minY - nextY);
-        shared.vy = Math.abs(shared.vy);
-      } else if (nextY > maxY) {
-        nextY = maxY - (nextY - maxY);
-        shared.vy = -Math.abs(shared.vy);
-      }
-      nextX = Math.max(minX, Math.min(maxX, nextX));
-      nextY = Math.max(minY, Math.min(maxY, nextY));
-      destination = ownerWindow;
-    }
+    return { x, y, vx, vy, updated: now };
+  }
 
-    const localX = keepInside(nextX - destination.contentLeft - half,
-                              destination.width - BALL_SIZE);
-    const localY = keepInside(nextY - destination.contentTop - half,
-                              destination.height - BALL_SIZE);
-    nextX = destination.contentLeft + localX + half;
-    nextY = destination.contentTop + localY + half;
-
-    const next = { ...shared, owner: destination.id, x: localX, y: localY,
-                   updated: Date.now() };
-    localStorage.setItem(BALL_KEY, JSON.stringify(next));
-    ball = next;
-
-    if (focusedWindow && contains(focusedWindow, nextX, nextY)) {
-      ballElement.style.display = 'block';
-      ballElement.style.left = (nextX - focusedWindow.contentLeft - half) + 'px';
-      ballElement.style.top = (nextY - focusedWindow.contentTop - half) + 'px';
-    } else {
+  function renderBall() {
+    const state = ballState;
+    if (!state || !ownRect) {
       ballElement.style.display = 'none';
+      return;
     }
+
+    const localX = state.x - ownRect.x;
+    const localY = state.y - ownRect.y;
+    const intersectsViewport =
+      localX + BALL_RADIUS >= 0 && localX - BALL_RADIUS <= ownRect.w &&
+      localY + BALL_RADIUS >= 0 && localY - BALL_RADIUS <= ownRect.h;
+
+    if (!intersectsViewport) {
+      ballElement.style.display = 'none';
+      return;
+    }
+
+    ballElement.style.display = 'block';
+    ballElement.style.left = (localX - BALL_RADIUS) + 'px';
+    ballElement.style.top = (localY - BALL_RADIUS) + 'px';
   }
 
-  function updateStatus() {
-    cachedWindows = readWindows();
-    const count = cachedWindows.length;
-    statusElement.textContent = count + ' window' + (count === 1 ? '' : 's') + ' connected' +
-      (ball && ball.owner === id ? ' · ball is here' : ' · ball is in another window');
-    helpElement.textContent = 'The ball can move between touching windows, including with a one-pixel gap. The active window drives the shared simulation.';
+  function updateStatus(now, hostId) {
+    if (now - lastStatusUpdate < 500) return;
+    lastStatusUpdate = now;
+
+    const count = windows.length;
+    statusElement.textContent = count + ' window' +
+      (count === 1 ? '' : 's') + ' connected' +
+      (hostId === id ? ' · driving shared physics' : ' · sharing the same ball');
+
+    helpElement.textContent =
+      'Open this page in separate browser windows. The ball moves through touching windows and gaps up to one pixel wide. Every window displays the same shared ball; uncovered edges act as walls.';
   }
 
-  function animate(now) {
-    const delta = now - lastFrame;
-    lastFrame = now;
-    step(delta);
-    requestAnimationFrame(animate);
-  }
+  function frame() {
+    const now = Date.now();
 
-  heartbeat();
-  ensureBall();
-  setInterval(() => {
-    heartbeat();
-    updateStatus();
-    // Recover if the window currently owning the ball was closed.
-    const current = getBall();
-    if (current && current.owner !== id) {
-      const liveWindows = readWindows();
-      const ownerAlive = liveWindows.some(w => w.id === current.owner);
-      const electedWindow = liveWindows.map(w => w.id).sort()[0];
-      if (!ownerAlive && electedWindow === id && Date.now() - current.updated > 600) {
-        saveBall({ ...current, owner: id,
-          x: keepInside(current.x, window.innerWidth - BALL_SIZE),
-          y: keepInside(current.y, window.innerHeight - BALL_SIZE) });
+    publishSelf();
+    if (now - lastRegistryRead >= REGISTRY_READ_MS) {
+      windows = readWindows();
+      lastRegistryRead = now;
+    }
+
+    const hostId = electHost(windows);
+
+    if (hostId === id) {
+      if (!wasHost || !ballState) {
+        ballState = readBall();
+        lastBallWrite = 0;
       }
-    }
-  }, HEARTBEAT_MS);
 
+      if (!ballState) {
+        ballState = createBall(windows, id, now);
+        writeBall(ballState);
+      } else {
+        ballState = advanceBall(ballState, windows, now);
+        if (now - lastBallWrite >= BALL_WRITE_MS) writeBall(ballState);
+      }
+      wasHost = true;
+    } else {
+      wasHost = false;
+      const latest = readBall();
+      if (latest) ballState = latest;
+    }
+
+    renderBall();
+    updateStatus(now, hostId);
+    requestAnimationFrame(frame);
+  }
+
+  // Storage events make other windows repaint promptly, while each page's
+  // animation loop remains independent of focus and of the physics host.
   window.addEventListener('storage', event => {
     if (event.key === BALL_KEY) {
-      ball = getBall();
-      if (ball && ball.owner !== id) ballElement.style.display = 'none';
+      const latest = readBall();
+      if (latest && !wasHost) ballState = latest;
+    }
+    if (event.key && event.key.startsWith(WINDOWS_PREFIX)) {
+      windows = readWindows();
+      lastRegistryRead = Date.now();
     }
   });
-  window.addEventListener('beforeunload', () => localStorage.removeItem(WINDOWS_PREFIX + id));
-  window.addEventListener('resize', heartbeat);
-  requestAnimationFrame(animate);
+
+  window.addEventListener('focus', () => publishSelf(true));
+  window.addEventListener('blur', () => publishSelf(true));
+  window.addEventListener('resize', () => publishSelf(true));
+  window.addEventListener('move', () => publishSelf(true));
+  document.addEventListener('visibilitychange', () => publishSelf(true));
+
+  function removeSelf() {
+    localStorage.removeItem(WINDOWS_PREFIX + id);
+  }
+  window.addEventListener('beforeunload', removeSelf);
+  window.addEventListener('pagehide', removeSelf);
+
+  // A timer supplements animation-frame sampling for geometry changes while
+  // this page is not the selected window. Each instance only writes its own key.
+  setInterval(() => {
+    publishSelf();
+    windows = readWindows();
+    lastRegistryRead = Date.now();
+  }, HEARTBEAT_MS);
+
+  publishSelf(true);
+  windows = readWindows();
+  requestAnimationFrame(frame);
 })();
 </script>
 </body>
