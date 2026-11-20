@@ -71,13 +71,11 @@
   let lastFocusState = null;
 
   function viewportRect() {
-    // Translate the page viewport, rather than the outer window frame, into
-    // global screen coordinates. All same-browser windows share these insets.
-    const horizontalInset = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
-    const verticalInset = Math.max(0, window.outerHeight - window.innerHeight);
+    // Match the original multiball experiment: every window reports screenX/Y
+    // and its inner viewport size in the same shared screen coordinate system.
     return {
-      x: window.screenX + horizontalInset,
-      y: window.screenY + verticalInset,
+      x: window.screenX,
+      y: window.screenY,
       w: window.innerWidth,
       h: window.innerHeight
     };
