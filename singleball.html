@@ -278,8 +278,10 @@
     // Recover if the window currently owning the ball was closed.
     const current = getBall();
     if (current && current.owner !== id) {
-      const ownerAlive = readWindows().some(w => w.id === current.owner);
-      if (!ownerAlive && Date.now() - current.updated > 600) {
+      const liveWindows = readWindows();
+      const ownerAlive = liveWindows.some(w => w.id === current.owner);
+      const electedWindow = liveWindows.map(w => w.id).sort()[0];
+      if (!ownerAlive && electedWindow === id && Date.now() - current.updated > 600) {
         saveBall({ ...current, owner: id,
           x: keepInside(current.x, window.innerWidth - BALL_SIZE),
           y: keepInside(current.y, window.innerHeight - BALL_SIZE) });
