@@ -62,12 +62,14 @@
 
   function viewportRect() {
     // screenX/screenY describe the outer browser window. Convert to the page viewport.
-    const left = window.screenX + Math.max(0, (window.outerWidth - window.innerWidth) / 2);
-    const top = window.screenY + Math.max(0, window.outerHeight - window.innerHeight);
+    const left = window.screenX;
+    const top = window.screenY;
     return {
       left, top,
-      right: left + window.innerWidth,
-      bottom: top + window.innerHeight,
+      right: left + window.outerWidth,
+      bottom: top + window.outerHeight,
+      contentLeft: left + Math.max(0, (window.outerWidth - window.innerWidth) / 2),
+      contentTop: top + Math.max(0, window.outerHeight - window.innerHeight),
       width: window.innerWidth,
       height: window.innerHeight
     };
@@ -97,6 +99,7 @@
     // immediately changes which neighbours qualify as connected.
     localStorage.setItem(WINDOWS_PREFIX + id, JSON.stringify({
       id, left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom,
+      contentLeft: rect.contentLeft, contentTop: rect.contentTop,
       width: rect.width, height: rect.height, heartbeat: Date.now()
     }));
     if (signature !== lastPosition) {
@@ -142,39 +145,39 @@
       let targetX = 0;
       let targetY = 0;
       if (edge === 'right') {
-        const overlapStart = Math.max(here.top, other.top);
-        const overlapEnd = Math.min(here.bottom, other.bottom);
+        const overlapStart = Math.max(here.contentTop, other.contentTop);
+        const overlapEnd = Math.min(here.contentTop + here.height, other.contentTop + other.height);
         touches = nearlyEqual(here.right, other.left, 3) &&
           overlapEnd > overlapStart && ballCentre >= overlapStart && ballCentre <= overlapEnd;
         if (touches) {
           targetX = 1;
-          targetY = ballCentre - other.top - BALL_SIZE / 2;
+          targetY = ballCentre - other.contentTop - BALL_SIZE / 2;
         }
       } else if (edge === 'left') {
-        const overlapStart = Math.max(here.top, other.top);
-        const overlapEnd = Math.min(here.bottom, other.bottom);
+        const overlapStart = Math.max(here.contentTop, other.contentTop);
+        const overlapEnd = Math.min(here.contentTop + here.height, other.contentTop + other.height);
         touches = nearlyEqual(here.left, other.right, 3) &&
           overlapEnd > overlapStart && ballCentre >= overlapStart && ballCentre <= overlapEnd;
         if (touches) {
           targetX = other.width - BALL_SIZE - 1;
-          targetY = ballCentre - other.top - BALL_SIZE / 2;
+          targetY = ballCentre - other.contentTop - BALL_SIZE / 2;
         }
       } else if (edge === 'bottom') {
-        const overlapStart = Math.max(here.left, other.left);
-        const overlapEnd = Math.min(here.right, other.right);
+        const overlapStart = Math.max(here.contentLeft, other.contentLeft);
+        const overlapEnd = Math.min(here.contentLeft + here.width, other.contentLeft + other.width);
         touches = nearlyEqual(here.bottom, other.top, 3) &&
           overlapEnd > overlapStart && ballCentre >= overlapStart && ballCentre <= overlapEnd;
         if (touches) {
-          targetX = ballCentre - other.left - BALL_SIZE / 2;
+          targetX = ballCentre - other.contentLeft - BALL_SIZE / 2;
           targetY = 1;
         }
       } else if (edge === 'top') {
-        const overlapStart = Math.max(here.left, other.left);
-        const overlapEnd = Math.min(here.right, other.right);
+        const overlapStart = Math.max(here.contentLeft, other.contentLeft);
+        const overlapEnd = Math.min(here.contentLeft + here.width, other.contentLeft + other.width);
         touches = nearlyEqual(here.top, other.bottom, 3) &&
           overlapEnd > overlapStart && ballCentre >= overlapStart && ballCentre <= overlapEnd;
         if (touches) {
-          targetX = ballCentre - other.left - BALL_SIZE / 2;
+          targetX = ballCentre - other.contentLeft - BALL_SIZE / 2;
           targetY = other.height - BALL_SIZE - 1;
         }
       }
@@ -205,7 +208,7 @@
 
     // Check each crossed edge against the latest geometry of every live window.
     if (x > maxX) {
-      const neighbour = findNeighbour('right', viewportRect().top + y + BALL_SIZE / 2);
+      const neighbour = findNeighbour('right', viewportRect().contentTop + y + BALL_SIZE / 2);
       if (neighbour) {
         saveBall({ ...ball, owner: neighbour.window.id, x: keepInside(neighbour.x, neighbour.window.width - BALL_SIZE),
           y: keepInside(neighbour.y, neighbour.window.height - BALL_SIZE), vx: Math.abs(ball.vx), updated: Date.now() });
@@ -214,7 +217,7 @@
       }
       x = maxX; ball.vx = -Math.abs(ball.vx);
     } else if (x < 0) {
-      const neighbour = findNeighbour('left', viewportRect().top + y + BALL_SIZE / 2);
+      const neighbour = findNeighbour('left', viewportRect().contentTop + y + BALL_SIZE / 2);
       if (neighbour) {
         saveBall({ ...ball, owner: neighbour.window.id, x: keepInside(neighbour.x, neighbour.window.width - BALL_SIZE),
           y: keepInside(neighbour.y, neighbour.window.height - BALL_SIZE), vx: -Math.abs(ball.vx), updated: Date.now() });
@@ -225,7 +228,7 @@
     }
 
     if (y > maxY) {
-      const neighbour = findNeighbour('bottom', viewportRect().left + x + BALL_SIZE / 2);
+      const neighbour = findNeighbour('bottom', viewportRect().contentLeft + x + BALL_SIZE / 2);
       if (neighbour) {
         saveBall({ ...ball, owner: neighbour.window.id, x: keepInside(neighbour.x, neighbour.window.width - BALL_SIZE),
           y: keepInside(neighbour.y, neighbour.window.height - BALL_SIZE), vy: Math.abs(ball.vy), updated: Date.now() });
@@ -234,7 +237,7 @@
       }
       y = maxY; ball.vy = -Math.abs(ball.vy);
     } else if (y < 0) {
-      const neighbour = findNeighbour('top', viewportRect().left + x + BALL_SIZE / 2);
+      const neighbour = findNeighbour('top', viewportRect().contentLeft + x + BALL_SIZE / 2);
       if (neighbour) {
         saveBall({ ...ball, owner: neighbour.window.id, x: keepInside(neighbour.x, neighbour.window.width - BALL_SIZE),
           y: keepInside(neighbour.y, neighbour.window.height - BALL_SIZE), vy: -Math.abs(ball.vy), updated: Date.now() });
