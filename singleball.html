@@ -39,8 +39,8 @@
 
   const WINDOWS_PREFIX = 'singleball_window_';
   const BALL_KEY = 'singleball_shared_ball_v1';
-  const WINDOW_TTL = 2500;
-  const HEARTBEAT_MS = 250;
+  const WINDOW_TTL = 15000;
+  const HEARTBEAT_MS = 1000;
   const BALL_SIZE = 34;
   const SPEED = 2.7;
 
@@ -191,68 +191,95 @@
   }
 
   function step(delta) {
-    if (!ball) ball = getBall();
-    if (!ball) return;
+    // The focused window drives the shared simulation, even when the ball's
+    // logical owner is a background window. Background requestAnimationFrame
+    // loops are commonly throttled by browsers.
+    if (document.visibilityState !== 'visible' || !document.hasFocus()) return;
 
-    if (ball.owner !== id) {
-      ballElement.style.display = 'none';
-      return;
+    const shared = getBall();
+    if (!shared) return;
+
+    const windows = readWindows();
+    let ownerWindow = windows.find(w => w.id === shared.owner);
+    if (!ownerWindow) {
+      ownerWindow = windows.find(w => w.id === id);
+      if (!ownerWindow) return;
+      saveBall({ ...shared, owner: id,
+        x: keepInside(shared.x, ownerWindow.width - BALL_SIZE),
+        y: keepInside(shared.y, ownerWindow.height - BALL_SIZE) });
     }
 
-    ballElement.style.display = 'block';
     const dt = Math.min(delta, 32) / 16.67;
-    let x = ball.x + ball.vx * dt;
-    let y = ball.y + ball.vy * dt;
-    const maxX = window.innerWidth - BALL_SIZE;
-    const maxY = window.innerHeight - BALL_SIZE;
+    const oldCentreX = ownerWindow.contentLeft + shared.x + BALL_SIZE / 2;
+    const oldCentreY = ownerWindow.contentTop + shared.y + BALL_SIZE / 2;
+    let nextCentreX = oldCentreX + shared.vx * dt;
+    let nextCentreY = oldCentreY + shared.vy * dt;
 
-    // Check each crossed edge against the latest geometry of every live window.
-    if (x > maxX) {
-      const neighbour = findNeighbour('right', viewportRect().contentTop + y + BALL_SIZE / 2);
-      if (neighbour) {
-        saveBall({ ...ball, owner: neighbour.window.id, x: keepInside(neighbour.x, neighbour.window.width - BALL_SIZE),
-          y: keepInside(neighbour.y, neighbour.window.height - BALL_SIZE), vx: Math.abs(ball.vx), updated: Date.now() });
-        ballElement.style.display = 'none';
-        return;
-      }
-      x = maxX; ball.vx = -Math.abs(ball.vx);
-    } else if (x < 0) {
-      const neighbour = findNeighbour('left', viewportRect().contentTop + y + BALL_SIZE / 2);
-      if (neighbour) {
-        saveBall({ ...ball, owner: neighbour.window.id, x: keepInside(neighbour.x, neighbour.window.width - BALL_SIZE),
-          y: keepInside(neighbour.y, neighbour.window.height - BALL_SIZE), vx: -Math.abs(ball.vx), updated: Date.now() });
-        ballElement.style.display = 'none';
-        return;
-      }
-      x = 0; ball.vx = Math.abs(ball.vx);
+    const contains = (w, cx, cy) =>
+      cx >= w.contentLeft && cx <= w.contentLeft + w.width &&
+      cy >= w.contentTop && cy <= w.contentTop + w.height;
+
+    // Prefer the focused window whenever the ball is inside its viewport.
+    // This makes overlap a valid transfer area and keeps the ball visible
+    // above background windows.
+    const focusedWindow = windows.find(w => w.id === id);
+    let destination = focusedWindow && contains(focusedWindow, nextCentreX, nextCentreY)
+      ? focusedWindow
+      : (contains(ownerWindow, nextCentreX, nextCentreY) ? ownerWindow : null);
+
+    // If the ball has left its current window, look for any other live
+    // viewport containing its new position. This handles touching and
+    // overlapping windows without requiring exact edge alignment.
+    if (!destination) {
+      destination = windows.find(w => w.id !== ownerWindow.id &&
+        contains(w, nextCentreX, nextCentreY)) || null;
     }
 
-    if (y > maxY) {
-      const neighbour = findNeighbour('bottom', viewportRect().contentLeft + x + BALL_SIZE / 2);
-      if (neighbour) {
-        saveBall({ ...ball, owner: neighbour.window.id, x: keepInside(neighbour.x, neighbour.window.width - BALL_SIZE),
-          y: keepInside(neighbour.y, neighbour.window.height - BALL_SIZE), vy: Math.abs(ball.vy), updated: Date.now() });
-        ballElement.style.display = 'none';
-        return;
+    if (!destination) {
+      // No other window covers the ball's next position: the current
+      // window's boundary is a wall.
+      const minX = ownerWindow.contentLeft + BALL_SIZE / 2;
+      const maxX = ownerWindow.contentLeft + ownerWindow.width - BALL_SIZE / 2;
+      const minY = ownerWindow.contentTop + BALL_SIZE / 2;
+      const maxY = ownerWindow.contentTop + ownerWindow.height - BALL_SIZE / 2;
+
+      if (nextCentreX < minX) {
+        nextCentreX = minX + (minX - nextCentreX);
+        shared.vx = Math.abs(shared.vx);
+      } else if (nextCentreX > maxX) {
+        nextCentreX = maxX - (nextCentreX - maxX);
+        shared.vx = -Math.abs(shared.vx);
       }
-      y = maxY; ball.vy = -Math.abs(ball.vy);
-    } else if (y < 0) {
-      const neighbour = findNeighbour('top', viewportRect().contentLeft + x + BALL_SIZE / 2);
-      if (neighbour) {
-        saveBall({ ...ball, owner: neighbour.window.id, x: keepInside(neighbour.x, neighbour.window.width - BALL_SIZE),
-          y: keepInside(neighbour.y, neighbour.window.height - BALL_SIZE), vy: -Math.abs(ball.vy), updated: Date.now() });
-        ballElement.style.display = 'none';
-        return;
+      if (nextCentreY < minY) {
+        nextCentreY = minY + (minY - nextCentreY);
+        shared.vy = Math.abs(shared.vy);
+      } else if (nextCentreY > maxY) {
+        nextCentreY = maxY - (nextCentreY - maxY);
+        shared.vy = -Math.abs(shared.vy);
       }
-      y = 0; ball.vy = Math.abs(ball.vy);
+      destination = ownerWindow;
     }
 
-    ball.x = keepInside(x, maxX);
-    ball.y = keepInside(y, maxY);
-    ball.updated = Date.now();
-    ballElement.style.left = ball.x + 'px';
-    ballElement.style.top = ball.y + 'px';
-    localStorage.setItem(BALL_KEY, JSON.stringify(ball));
+    const next = {
+      ...shared,
+      owner: destination.id,
+      x: keepInside(nextCentreX - destination.contentLeft - BALL_SIZE / 2,
+        destination.width - BALL_SIZE),
+      y: keepInside(nextCentreY - destination.contentTop - BALL_SIZE / 2,
+        destination.height - BALL_SIZE),
+      updated: Date.now()
+    };
+
+    localStorage.setItem(BALL_KEY, JSON.stringify(next));
+    ball = next;
+
+    if (destination.id === id) {
+      ballElement.style.display = 'block';
+      ballElement.style.left = next.x + 'px';
+      ballElement.style.top = next.y + 'px';
+    } else {
+      ballElement.style.display = 'none';
+    }
   }
 
   function updateStatus() {
@@ -260,7 +287,7 @@
     const count = cachedWindows.length;
     statusElement.textContent = count + ' window' + (count === 1 ? '' : 's') + ' connected' +
       (ball && ball.owner === id ? ' · ball is here' : ' · ball is in another window');
-    helpElement.textContent = 'Move browser windows so their edges meet exactly. Gaps and overlaps count as walls. Keep this page open in each window.';
+    helpElement.textContent = 'The ball can move between touching or overlapping windows. The focused window keeps the simulation running even when the ball is in a background window.';
   }
 
   function animate(now) {
