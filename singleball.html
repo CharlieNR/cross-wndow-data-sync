@@ -240,7 +240,7 @@
     for (let i = 0; i < steps; i++) {
       const nextX = x + vx * dt;
       const leadingX = nextX + (vx >= 0 ? BALL_RADIUS : -BALL_RADIUS);
-      if (coveredAt(rects, leadingX, y)) {
+      if (coveredAt(rects, nextX, y) && coveredAt(rects, leadingX, y)) {
         x = nextX;
       } else {
         vx = -vx;
@@ -248,7 +248,7 @@
 
       const nextY = y + vy * dt;
       const leadingY = nextY + (vy >= 0 ? BALL_RADIUS : -BALL_RADIUS);
-      if (coveredAt(rects, x, leadingY)) {
+      if (coveredAt(rects, x, nextY) && coveredAt(rects, x, leadingY)) {
         y = nextY;
       } else {
         vy = -vy;
